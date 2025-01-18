@@ -1,0 +1,45 @@
+metadata:
+  title: "This is a very complex project"
+  author: "haitch"
+  year: "2025"
+
+hardware:
+  128k_only: true
+  use_ay: true
+  model: "+2"
+
+blocks:
+  # Menu section
+  - group: "Menu"
+    file: menu.tap
+    desc: "A Fantastic Menu"
+
+  # Level 1
+  - group: "Breathtaking Level 1"
+    file: loader1.tap
+    desc: "Loader of the amazing Level 1"
+  - file: screen1.tap
+  - file: data1.tap
+
+  # Level 2 with jump option
+  - id: level2_start
+    group: "The Astonishing Level 2"
+    file: loader2.tap
+  - file: screen2.tap
+  - file: data2.tap
+  - jump_to: end  # Skip level 3 if needed
+
+  # Level 3
+  - group: "Magnup opus"
+    file: loader3.tap
+  - file: screen3.tap
+  - file: data3.tap
+  - id: end
+
+  # Sound data with loop
+  - group: "Sound Data"
+    desc: "Background Music"
+  - loop_start: 2
+  - file: sound1.tap
+  - file: sound2.tap
+  - id: loop_end
