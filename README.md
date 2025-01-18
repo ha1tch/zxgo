@@ -126,8 +126,7 @@ zxgotools/
 ## Contact
 
 - Email: haitch@duck.com
-- Mastodon: [@haitchfive@oldbytes.space](https://oldbytes.space/haitchfive)
-
+- Mastodon: [@haitchfive@oldbytes.space](https://oldbytes.space/@haitchfive)
 ## License
 
 Licensed under the Apache License, Version 2.0. See LICENSE file for details.
