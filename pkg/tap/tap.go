@@ -1,170 +1,176 @@
-package main
+package tap
 
 import (
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
-// TAPMetadata contains the information from the TAP header block
-type TAPMetadata struct {
-	Type         byte    // 0=program, 1=number array, 2=character array, 3=code/bytes
-	Filename     string  // Up to 10 characters
-	DataLength   uint16  // Expected length of the data
-	StartAddress uint16  // For code blocks, where to load in memory
-	AutoStart    *uint16 // For BASIC programs, which line to auto-start (nil if not applicable)
-	VarName      *byte   // For arrays, the variable name (nil if not applicable)
+const (
+	HeaderLength = 0x13
+	HeaderFlag   = 0x00
+	DataFlag     = 0xFF
+
+	// Block types
+	Program = 0x00
+	Data    = 0x01
+	Chars   = 0x02
+	Bytes   = 0x03
+)
+
+// Header represents a TAP file header block
+type Header struct {
+	BlockLength uint16
+	Flag        byte
+	Type        byte
+	Filename    [10]byte
+	DataLength  uint16
+	Param1      uint16 // Start address for bytes, autostart line for program
+	Param2      uint16 // Program length for program, 32768 for bytes
+	Checksum    byte
 }
 
-// verifyChecksum performs XOR of all bytes including flag byte
-func verifyChecksum(data []byte, checksum byte) bool {
-	result := byte(0)
+// calculateChecksum performs XOR of all bytes
+func calculateChecksum(data []byte) byte {
+	var checksum byte
 	for _, b := range data {
-		result ^= b
+		checksum ^= b
 	}
-	return result == checksum
+	return checksum
 }
 
-// parseHeader extracts metadata from a header block
-func parseHeader(headerData []byte) (*TAPMetadata, error) {
-	if len(headerData) != 19 { // flag + 17 bytes + checksum
-		return nil, fmt.Errorf("invalid header length: %d", len(headerData))
+// createHeaderBlock creates a TAP header block
+func createHeaderBlock(blockType byte, filename string, dataLength uint16, param1, param2 uint16) []byte {
+	header := Header{
+		BlockLength: HeaderLength,
+		Flag:        HeaderFlag,
+		Type:        blockType,
+		DataLength:  dataLength,
+		Param1:      param1,
+		Param2:      param2,
 	}
 
-	if headerData[0] != 0x00 { // verify flag
-		return nil, fmt.Errorf("invalid header flag: 0x%02x", headerData[0])
+	// Pad filename with spaces
+	copy(header.Filename[:], []byte(filename))
+	for i := len(filename); i < 10; i++ {
+		header.Filename[i] = ' '
 	}
 
-	if !verifyChecksum(headerData[:len(headerData)-1], headerData[len(headerData)-1]) {
-		return nil, fmt.Errorf("header checksum mismatch")
-	}
+	// Create buffer for header data
+	headerData := make([]byte, 0, HeaderLength+2) // +2 for block length
 
-	blockType := headerData[1]
-	if blockType > 3 {
-		return nil, fmt.Errorf("invalid block type: %d", blockType)
-	}
+	// Write block length
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf, header.BlockLength)
+	headerData = append(headerData, buf...)
 
-	filename := strings.TrimRight(string(headerData[2:12]), " ")
-	dataLength := binary.LittleEndian.Uint16(headerData[12:14])
-	param1 := binary.LittleEndian.Uint16(headerData[14:16])
+	// Build header data for checksum calculation
+	checksumData := make([]byte, 0, HeaderLength-1) // -1 as checksum isn't included
+	checksumData = append(checksumData, header.Flag)
+	checksumData = append(checksumData, header.Type)
+	checksumData = append(checksumData, header.Filename[:]...)
 
-	metadata := &TAPMetadata{
-		Type:       blockType,
-		Filename:   filename,
-		DataLength: dataLength,
-	}
+	buf = make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf, header.DataLength)
+	checksumData = append(checksumData, buf...)
 
-	// Handle parameters based on block type
-	switch blockType {
-	case 0: // Program
-		metadata.AutoStart = &param1
-	case 1, 2: // Number or character array
-		varName := headerData[15] // param2 high byte contains variable name
-		metadata.VarName = &varName
-	case 3: // Code
-		metadata.StartAddress = param1
-	}
+	binary.LittleEndian.PutUint16(buf, header.Param1)
+	checksumData = append(checksumData, buf...)
 
-	return metadata, nil
+	binary.LittleEndian.PutUint16(buf, header.Param2)
+	checksumData = append(checksumData, buf...)
+
+	// Calculate and append checksum
+	header.Checksum = calculateChecksum(checksumData)
+
+	// Build final header block
+	headerData = append(headerData, checksumData...)
+	headerData = append(headerData, header.Checksum)
+
+	return headerData
 }
 
-// LoadTAPResult contains both the loaded data and its metadata
-type LoadTAPResult struct {
-	Data     []byte
-	Metadata *TAPMetadata
+// createDataBlock creates a TAP data block
+func createDataBlock(data []byte) []byte {
+	blockLength := uint16(len(data) + 2) // +2 for flag and checksum
+
+	// Create buffer for data block
+	dataBlock := make([]byte, 0, int(blockLength)+2) // +2 for block length
+
+	// Write block length
+	buf := make([]byte, 2)
+	binary.LittleEndian.PutUint16(buf, blockLength)
+	dataBlock = append(dataBlock, buf...)
+
+	// Write flag
+	dataBlock = append(dataBlock, DataFlag)
+
+	// Write data
+	dataBlock = append(dataBlock, data...)
+
+	// Calculate and append checksum
+	checksumData := dataBlock[2:] // Skip block length
+	checksum := calculateChecksum(checksumData)
+	dataBlock = append(dataBlock, checksum)
+
+	return dataBlock
 }
 
-func loadTap(filename string) (*LoadTAPResult, error) {
-	f, err := os.Open(filename)
+// BinaryToTAP converts a binary file to TAP format
+func BinaryToTAP(inputPath, outputPath, name string, startAddress uint16) error {
+	// Read input file
+	inputData, err := os.ReadFile(inputPath)
 	if err != nil {
-		return nil, fmt.Errorf("opening file: %w", err)
-	}
-	defer f.Close()
-
-	// First block must be a header
-	var headerLength uint16
-	if err := binary.Read(f, binary.LittleEndian, &headerLength); err != nil {
-		return nil, fmt.Errorf("reading header length: %w", err)
+		return fmt.Errorf("reading input file: %w", err)
 	}
 
-	if headerLength != 19 { // flag + 17 bytes + checksum
-		return nil, fmt.Errorf("invalid header block length: %d", headerLength)
+	// Use input filename if no name provided
+	if name == "" {
+		name = filepath.Base(inputPath)
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+		if len(name) > 10 {
+			name = name[:10]
+		}
 	}
 
-	headerBlock := make([]byte, headerLength)
-	if _, err := io.ReadFull(f, headerBlock); err != nil {
-		return nil, fmt.Errorf("reading header block: %w", err)
-	}
-
-	metadata, err := parseHeader(headerBlock)
+	// Create output file
+	outFile, err := os.Create(outputPath)
 	if err != nil {
-		return nil, fmt.Errorf("parsing header: %w", err)
+		return fmt.Errorf("creating output file: %w", err)
+	}
+	defer outFile.Close()
+
+	// Create and write header block for bytes
+	headerBlock := createHeaderBlock(Bytes, name, uint16(len(inputData)), startAddress, 0)
+	if _, err := outFile.Write(headerBlock); err != nil {
+		return fmt.Errorf("writing header block: %w", err)
 	}
 
-	// Read data block
-	var dataBlockLength uint16
-	if err := binary.Read(f, binary.LittleEndian, &dataBlockLength); err != nil {
-		return nil, fmt.Errorf("reading data block length: %w", err)
+	// Create and write data block
+	dataBlock := createDataBlock(inputData)
+	if _, err := outFile.Write(dataBlock); err != nil {
+		return fmt.Errorf("writing data block: %w", err)
 	}
 
-	// Data block should be: flag + data + checksum
-	if dataBlockLength != metadata.DataLength+2 {
-		return nil, fmt.Errorf("data block length mismatch: expected %d, got %d",
-			metadata.DataLength+2, dataBlockLength)
-	}
-
-	dataBlock := make([]byte, dataBlockLength)
-	if _, err := io.ReadFull(f, dataBlock); err != nil {
-		return nil, fmt.Errorf("reading data block: %w", err)
-	}
-
-	// Verify data block flag and checksum
-	if dataBlock[0] != 0xFF {
-		return nil, fmt.Errorf("invalid data block flag: 0x%02x", dataBlock[0])
-	}
-
-	if !verifyChecksum(dataBlock[:len(dataBlock)-1], dataBlock[len(dataBlock)-1]) {
-		return nil, fmt.Errorf("data block checksum mismatch")
-	}
-
-	// Extract just the data (without flag and checksum)
-	data := dataBlock[1 : len(dataBlock)-1]
-
-	// Verify no more blocks
-	var extraLength uint16
-	if err := binary.Read(f, binary.LittleEndian, &extraLength); err != io.EOF {
-		return nil, fmt.Errorf("unexpected extra data in file")
-	}
-
-	return &LoadTAPResult{
-		Data:     data,
-		Metadata: metadata,
-	}, nil
+	return nil
 }
 
-func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s file.tap\n", os.Args[0])
-		os.Exit(1)
+// WriteBasicToTAP writes a BASIC program to TAP format
+func WriteBasicToTAP(w io.Writer, name string, data []byte, autostart uint16) error {
+	// Create and write header block for BASIC program
+	headerBlock := createHeaderBlock(Program, name, uint16(len(data)), autostart, uint16(len(data)))
+	if _, err := w.Write(headerBlock); err != nil {
+		return fmt.Errorf("writing header block: %w", err)
 	}
 
-	result, err := loadTap(os.Args[1])
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	// Create and write data block
+	dataBlock := createDataBlock(data)
+	if _, err := w.Write(dataBlock); err != nil {
+		return fmt.Errorf("writing data block: %w", err)
 	}
 
-	fmt.Printf("Loaded '%s' (%d bytes)\n", result.Metadata.Filename, len(result.Data))
-	fmt.Printf("Type: %d\n", result.Metadata.Type)
-	
-	switch result.Metadata.Type {
-	case 0: // Program
-		fmt.Printf("Autostart line: %d\n", *result.Metadata.AutoStart)
-	case 1, 2: // Arrays
-		fmt.Printf("Variable name: %c\n", *result.Metadata.VarName)
-	case 3: // Code
-		fmt.Printf("Load address: %d\n", result.Metadata.StartAddress)
-	}
+	return nil
 }
