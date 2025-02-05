@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/ha1tch/zxgotools/pkg/tap"
+	"zxgotools/pkg/tap"
 )
 
 func main() {

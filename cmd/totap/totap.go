@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/ha1tch/zxgotools/pkg/basic"
-	"github.com/ha1tch/zxgotools/pkg/tap"
+	"zxgotools/pkg/basic"
+	"zxgotools/pkg/tap"
 )
 
 func main() {

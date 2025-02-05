@@ -4,16 +4,26 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 )
 
-// Number types in ZX Spectrum BASIC:
-// 1. Small integers (-65535 to +65535) - stored in 5 bytes
-// 2. Floating point numbers - stored in 5 bytes using Spectrum's custom format
+// Number types in the ZX Spectrum's Sinclair BASIC:
+// 1. Small integers (-65535 to +65535) - stored in 6 bytes
+// 2. Floating point numbers - stored in 6 bytes using Spectrum's custom format
 // 3. Binary numbers (BIN) - stored as small integers
 
 const (
 	numberMarker = 0x0E                  // Marks the start of a number in BASIC
 	shift31Bits  = float64(2147483648.0) // 2^31, used for mantissa calculation
+
+	// Number format limits
+	maxInt   = 65535
+	minInt   = -65535
+	maxExp   = 126
+	minExp   = -129
+	mantMask = 0x7F // Mask for mantissa bits in first byte
+	signMask = 0x80 // Mask for sign bit
+	expBias  = 0x81 // Exponent bias for floating point format
 )
 
 // parseNumber tries to parse and encode a number from the text
@@ -28,7 +38,7 @@ func (p *Parser) parseNumber(text string) ([]byte, int, error) {
 	for i < len(text) && (isDigit(text[i]) || text[i] == '.') {
 		if text[i] == '.' {
 			if hasDecimal {
-				return nil, 0, fmt.Errorf("multiple decimal points in number")
+				return nil, 0, fmt.Errorf("%s: multiple decimal points in number", p.errorPrefix)
 			}
 			hasDecimal = true
 		}
@@ -55,27 +65,28 @@ func (p *Parser) parseNumber(text string) ([]byte, int, error) {
 	numStr := text[:i]
 	val, err := strconv.ParseFloat(numStr, 64)
 	if err != nil {
-		return nil, 0, fmt.Errorf("invalid number format: %s", numStr)
+		return nil, 0, fmt.Errorf("%s: invalid number format: %s", p.errorPrefix, numStr)
 	}
 
-	// Encode the number
-	var result []byte
-
-	// Check if it can be stored as a small integer
+	// Check for integer representation
 	if !hasDecimal && !hasExponent {
 		intVal := int(math.Floor(val))
-		if intVal >= -65535 && intVal < 65535 {
+		if intVal >= minInt && intVal <= maxInt {
 			return encodeSmallInt(intVal), i, nil
 		}
 	}
 
 	// Encode as floating point
-	return encodeFloat(val), i, nil
+	result, err := encodeFloat(val)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: %w", p.errorPrefix, err)
+	}
+	return result, i, nil
 }
 
 // parseBinaryNumber handles BIN format numbers (e.g., BIN 01101)
 func (p *Parser) parseBinaryNumber(text string) ([]byte, int, error) {
-	if len(text) < 4 || text[0:3] != "BIN" { // Must start with "BIN"
+	if len(text) < 4 || !strings.HasPrefix(text, "BIN") { // Must start with "BIN"
 		return nil, 0, nil
 	}
 
@@ -86,7 +97,7 @@ func (p *Parser) parseBinaryNumber(text string) ([]byte, int, error) {
 	}
 
 	if pos >= len(text) {
-		return nil, 0, fmt.Errorf("expected binary digits after BIN")
+		return nil, 0, fmt.Errorf("%s: expected binary digits after BIN", p.errorPrefix)
 	}
 
 	// Read binary digits
@@ -94,14 +105,14 @@ func (p *Parser) parseBinaryNumber(text string) ([]byte, int, error) {
 	start := pos
 	for pos < len(text) && (text[pos] == '0' || text[pos] == '1') {
 		value = value*2 + int(text[pos]-'0')
-		if value > 65535 {
-			return nil, 0, fmt.Errorf("binary number too large")
+		if value > maxInt {
+			return nil, 0, fmt.Errorf("%s: binary number too large (maximum is %d)", p.errorPrefix, maxInt)
 		}
 		pos++
 	}
 
 	if pos == start {
-		return nil, 0, fmt.Errorf("expected binary digits after BIN")
+		return nil, 0, fmt.Errorf("%s: expected binary digits after BIN", p.errorPrefix)
 	}
 
 	// Return as small integer
@@ -117,9 +128,11 @@ func (p *Parser) parseBinaryNumber(text string) ([]byte, int, error) {
 // - byte 4: high byte
 // - byte 5: 0x00
 func encodeSmallInt(val int) []byte {
-	if val < -65535 || val > 65535 {
-		// Should never happen as caller checks, but defensive programming
-		val = 0
+	// Defensive programming - ensure value is in range
+	if val < minInt {
+		val = minInt
+	} else if val > maxInt {
+		val = maxInt
 	}
 
 	result := make([]byte, 6)
@@ -148,27 +161,26 @@ func encodeSmallInt(val int) []byte {
 // - byte 3: bits 24-17 of mantissa
 // - byte 4: bits 16-9 of mantissa
 // - byte 5: bits 8-1 of mantissa
-func encodeFloat(val float64) []byte {
+func encodeFloat(val float64) ([]byte, error) {
 	result := make([]byte, 6)
 	result[0] = numberMarker
 
 	// Handle zero specially
 	if val == 0 {
-		return result // All bytes are already 0
+		return result, nil // All bytes are already 0
 	}
 
 	// Handle negative numbers
 	sign := byte(0)
 	if val < 0 {
-		sign = 0x80
+		sign = signMask
 		val = -val
 	}
 
 	// Calculate exponent and mantissa
 	exp := math.Floor(math.Log2(val))
-	if exp < -129 || exp > 126 {
-		// Number too big/small - return 0
-		return result
+	if exp < minExp || exp > maxExp {
+		return nil, fmt.Errorf("number out of range (exponent %d not in range %d to %d)", int(exp), minExp, maxExp)
 	}
 
 	// Calculate mantissa between 1 and 2
@@ -179,11 +191,11 @@ func encodeFloat(val float64) []byte {
 	mantissaInt := uint32(math.Floor(mantissa + 0.5))
 
 	// Pack the bytes
-	result[1] = byte(exp) + 0x81 // Bias the exponent
-	result[2] = byte((mantissaInt>>24)&0x7F) | sign
+	result[1] = byte(exp) + expBias // Bias the exponent
+	result[2] = byte((mantissaInt>>24)&mantMask) | sign
 	result[3] = byte((mantissaInt >> 16) & 0xFF)
 	result[4] = byte((mantissaInt >> 8) & 0xFF)
 	result[5] = byte(mantissaInt & 0xFF)
 
-	return result
+	return result, nil
 }
